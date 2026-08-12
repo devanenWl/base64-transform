@@ -760,10 +760,7 @@ function decodeIncoming(text) {
  * @param {string} [_source]
  * @returns {void}
  */
-function onMessageReceived(
-    messageId,
-    _source,
-) {
+function onMessageReceived(messageId, _source) {
     try {
         if (
             !Number.isInteger(messageId) ||
@@ -772,11 +769,9 @@ function onMessageReceived(
             return;
         }
 
-        const context =
-            SillyTavern.getContext();
+        const context = SillyTavern.getContext();
 
-        const message =
-            context.chat?.[messageId];
+        const message = context.chat?.[messageId];
 
         if (
             !message ||
@@ -787,28 +782,115 @@ function onMessageReceived(
             return;
         }
 
+        let changed = false;
+
+        /*
+         * Decode the actual stored message.
+         */
         if (
-            typeof message.mes !== 'string' ||
-            message.mes.length === 0
+            typeof message.mes === 'string' &&
+            message.mes.length > 0
         ) {
+            const before = message.mes;
+            const after = decodeIncoming(before);
+
+            if (after !== before) {
+                message.mes = after;
+                changed = true;
+
+                if (DEBUG) {
+                    console.info(
+                        `[${MODULE_NAME}] Decoded message ${messageId}: ` +
+                        `${before.length} -> ${after.length} chars.`,
+                    );
+                }
+            }
+        }
+
+        /*
+         * SillyTavern's renderer prefers extra.display_text over mes:
+         *
+         *     message.extra?.display_text ?? message.mes
+         *
+         * So decode display_text too if another extension/provider created it.
+         */
+        if (
+            message.extra &&
+            typeof message.extra.display_text === 'string' &&
+            message.extra.display_text.length > 0
+        ) {
+            const beforeDisplay = message.extra.display_text;
+            const afterDisplay = decodeIncoming(beforeDisplay);
+
+            if (afterDisplay !== beforeDisplay) {
+                message.extra.display_text = afterDisplay;
+                changed = true;
+            }
+        }
+
+        if (!changed) {
             return;
         }
 
-        const before = message.mes;
-
-        const after = decodeIncoming(before);
-
-        if (after === before) {
-            return;
-        }
-
-        message.mes = after;
-
-        if (DEBUG) {
-            console.info(
-                `[${MODULE_NAME}] Decoded incoming message ${messageId}. ` +
-                `${before.length} -> ${after.length} chars.`,
+        /*
+         * IMPORTANT FOR STREAMING
+         * -----------------------
+         *
+         * During streaming, SillyTavern renders the final text BEFORE
+         * MESSAGE_RECEIVED fires.
+         *
+         * Mutating message.mes therefore changes the chat data but does not
+         * automatically replace the already-rendered DOM.
+         *
+         * updateMessageBlock() performs the normal SillyTavern formatting
+         * pipeline again and replaces .mes_text immediately.
+         *
+         * During non-streaming generation the DOM might not exist yet.
+         * That's fine: SillyTavern will call addOneMessage() immediately
+         * after MESSAGE_RECEIVED and render our decoded message normally.
+         */
+        if (typeof context.updateMessageBlock === 'function') {
+            context.updateMessageBlock(
+                messageId,
+                message,
+                {
+                    rerenderMessage: true,
+                },
             );
+        } else {
+            /*
+             * Compatibility fallback for older SillyTavern builds.
+             *
+             * Avoid manually writing decoded text with .html() here because
+             * that would bypass SillyTavern's Markdown / Regex / sanitizer
+             * formatting pipeline.
+             */
+            console.warn(
+                `[${MODULE_NAME}] updateMessageBlock() is unavailable. ` +
+                `Message ${messageId} was decoded in chat state but could not ` +
+                `be immediately re-rendered.`,
+            );
+        }
+
+        /*
+         * IMPORTANT FOR SWIPES
+         * --------------------
+         *
+         * In the streaming code path SillyTavern calls syncMesToSwipe()
+         * BEFORE MESSAGE_RECEIVED.
+         *
+         * That means the current swipe may still contain the encoded version
+         * even though message.mes has now been decoded.
+         *
+         * Keep the active swipe synchronized with the decoded text.
+         */
+        if (
+            Array.isArray(message.swipes) &&
+            Number.isInteger(message.swipe_id) &&
+            message.swipe_id >= 0 &&
+            message.swipe_id < message.swipes.length
+        ) {
+            message.swipes[message.swipe_id] = message.mes;
         }
     } catch (error) {
         console.error(
