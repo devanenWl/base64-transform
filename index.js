@@ -3,32 +3,44 @@ import {
     runRegexScript,
 } from '/scripts/extensions/regex/engine.js';
 
+
 const MODULE_NAME = 'Base64PromptTransform';
 
 /**
- * true:
- *   - Global regex
- *   - Character/scoped regex chỉ khi đã Allow
- *   - Preset regex chỉ khi đã Allow
+ * When true, only Regex scripts currently allowed by SillyTavern are used.
  *
- * false:
- *   - lấy cả scoped/preset regex chưa được Allow
+ * This means:
+ * - Global Regex scripts are included.
+ * - Character-scoped Regex scripts are included only when allowed.
+ * - Preset Regex scripts are included only when allowed.
  *
- * Khuyên giữ true.
+ * Keeping this enabled is recommended because it follows SillyTavern's
+ * normal Regex permission behavior.
  */
 const ALLOWED_ONLY = true;
 
 /**
- * Log tên các rule được sử dụng.
- * Không log toàn bộ prompt để tránh spam/privacy.
+ * Enable informational console logs.
+ *
+ * The extension intentionally does not print the full prompt to the console.
  */
 const DEBUG = true;
 
 
 /* ============================================================
- * Base64
+ * UTF-8 Base64 encoding
  * ============================================================ */
 
+/**
+ * Encodes an arbitrary Unicode string as Base64.
+ *
+ * Calling btoa() directly on Unicode text may fail for characters outside
+ * the Latin-1 range. TextEncoder converts the input to UTF-8 bytes first,
+ * allowing Vietnamese, Japanese, Chinese, emoji, etc. to work correctly.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
 function encodeBase64Utf8(text) {
     const bytes = new TextEncoder().encode(text);
 
@@ -43,24 +55,38 @@ function encodeBase64Utf8(text) {
 
 
 /* ============================================================
- * Detect B64 Regex rules
+ * Base64 Regex rule discovery
  * ============================================================ */
 
 /**
- * Chỉ lấy những Regex script có dạng replacement chứa:
+ * Determines whether a SillyTavern Regex script should be treated as a
+ * Base64 transformation rule.
  *
- * [[b64]] ... [[/b64]]
+ * A rule is considered a Base64 rule when its replacement contains both:
  *
- * Ví dụ:
- * [[b64]]{{match}}[[/b64]]
- * [[b64]]$1[[/b64]]
+ *     [[b64]]
+ *     [[/b64]]
+ *
+ * Example:
+ *
+ *     Find Regex:
+ *     /\b(?:sexuality|violence|weapons?)\b/gi
+ *
+ *     Replace With:
+ *     [[b64]]{{match}}[[/b64]]
+ *
+ * @param {object} script
+ * @returns {boolean}
  */
 function isBase64RegexScript(script) {
     if (!script || script.disabled) {
         return false;
     }
 
-    if (typeof script.findRegex !== 'string' || !script.findRegex) {
+    if (
+        typeof script.findRegex !== 'string' ||
+        script.findRegex.length === 0
+    ) {
         return false;
     }
 
@@ -76,8 +102,14 @@ function isBase64RegexScript(script) {
 
 
 /**
- * Lấy tất cả Regex scripts từ Regex engine của SillyTavern,
- * sau đó lọc ra các B64 rules.
+ * Retrieves all currently available SillyTavern Regex scripts and returns
+ * only the rules configured to produce [[b64]] markers.
+ *
+ * This is evaluated for every prompt generation, so changes made in the
+ * Regex UI are automatically picked up without duplicating the keyword
+ * list inside this extension.
+ *
+ * @returns {Array<object>}
  */
 function getBase64RegexScripts() {
     const scripts = getRegexScripts({
@@ -93,48 +125,53 @@ function getBase64RegexScripts() {
  * ============================================================ */
 
 /**
- * Có một vấn đề:
+ * Existing [[b64]] markers may already have been created by SillyTavern's
+ * normal Regex pipeline.
  *
- * Built-in Regex có thể đã biến:
+ * For example:
  *
- * Sexuality
+ *     violence
  *
- * thành:
+ * may already be:
  *
- * [[b64]]Sexuality[[/b64]]
+ *     [[b64]]violence[[/b64]]
  *
- * trước khi extension này chạy.
+ * before this extension receives the final prompt.
  *
- * Nếu chúng ta re-run Regex trực tiếp:
+ * If the same Regex rule were applied again without protection, it could
+ * produce nested markers such as:
  *
- * [[b64]]Sexuality[[/b64]]
+ *     [[b64]][[b64]]violence[[/b64]][[/b64]]
  *
- * có thể thành:
+ * To prevent this:
  *
- * [[b64]][[b64]]Sexuality[[/b64]][[/b64]]
+ * 1. Existing markers are immediately Base64-encoded.
+ * 2. Their encoded values are temporarily replaced by private placeholders.
+ * 3. Additional Regex rules are applied.
+ * 4. Newly created markers are protected in the same way.
+ * 5. The placeholders are restored as their final Base64 strings.
  *
- * => encode hai lần / marker bị nested.
- *
- * Vì vậy:
- *
- * 1. tìm marker đang tồn tại
- * 2. Base64 nó
- * 3. tạm thay bằng private placeholder
- * 4. re-run Regex khác
- * 5. cuối cùng restore Base64
+ * @param {string} text
+ * @param {Array<{token: string, encoded: string}>} vault
+ * @returns {string}
  */
 function protectAndEncodeMarkers(text, vault) {
-    if (typeof text !== 'string' || !text) {
+    if (typeof text !== 'string' || text.length === 0) {
         return text;
     }
 
     return text.replace(
         /\[\[b64\]\]([\s\S]*?)\[\[\/b64\]\]/gi,
         (_, content) => {
-            const id = vault.length;
+            const index = vault.length;
 
+            /*
+             * Private Use Area characters are added around the placeholder
+             * to make accidental collisions with normal prompt text extremely
+             * unlikely.
+             */
             const token =
-                `\uE000B64PROTECTED_${id}_${Math.random()
+                `\uE000B64_PROTECTED_${index}_${Math.random()
                     .toString(36)
                     .slice(2)}\uE001`;
 
@@ -149,13 +186,20 @@ function protectAndEncodeMarkers(text, vault) {
 }
 
 
+/**
+ * Restores all protected placeholders to their final Base64 values.
+ *
+ * @param {string} text
+ * @param {Array<{token: string, encoded: string}>} vault
+ * @returns {string}
+ */
 function restoreProtectedMarkers(text, vault) {
     let result = text;
 
-    for (const item of vault) {
+    for (const entry of vault) {
         result = result.replaceAll(
-            item.token,
-            item.encoded,
+            entry.token,
+            entry.encoded,
         );
     }
 
@@ -164,31 +208,42 @@ function restoreProtectedMarkers(text, vault) {
 
 
 /* ============================================================
- * Apply SillyTavern Regex rules
+ * Regex transformation
  * ============================================================ */
 
 /**
- * Quan trọng:
+ * Applies every Base64 Regex rule directly to a string.
  *
- * Ta gọi runRegexScript() TRỰC TIẾP.
+ * This intentionally calls runRegexScript() rather than getRegexedString().
  *
- * Không gọi getRegexedString().
+ * getRegexedString() respects normal Regex placement restrictions such as:
  *
- * Vì getRegexedString() sẽ check:
+ * - User Input
+ * - AI Output
+ * - World Info
+ * - Reasoning
  *
- *   User Input
- *   AI Output
- *   World Info
- *   Reasoning
- *   placement
- *   depth
+ * Character Description, Personality, Scenario, and some other prompt
+ * components are not normal Regex placements.
  *
- * Character Definition không thuộc các placement đó.
+ * By calling runRegexScript() directly on the final assembled prompt,
+ * the same Regex rules can also affect those prompt components.
  *
- * runRegexScript() thì apply trực tiếp regex lên raw string.
+ * Using runRegexScript() also preserves SillyTavern's native behavior for:
+ *
+ * - {{match}}
+ * - $1, $2, etc.
+ * - Named capture groups
+ * - Regex macros
+ * - Trim strings
+ * - Replacement macros
+ *
+ * @param {string} text
+ * @param {Array<object>} scripts
+ * @returns {string}
  */
 function transformText(text, scripts) {
-    if (typeof text !== 'string' || !text) {
+    if (typeof text !== 'string' || text.length === 0) {
         return text;
     }
 
@@ -197,31 +252,20 @@ function transformText(text, scripts) {
     let result = text;
 
     /*
-     * Step 1
-     *
-     * Consume/protect marker đã được built-in Regex tạo ra.
-     *
-     * Example:
-     *
-     * [[b64]]BDSM[[/b64]]
-     *
-     * => temporary placeholder
+     * First consume markers that may already have been produced by the normal
+     * SillyTavern Regex pipeline.
      */
     result = protectAndEncodeMarkers(
         result,
         vault,
     );
 
-
     /*
-     * Step 2
+     * Reapply every Base64 Regex rule against the final prompt text.
      *
-     * Re-run EVERY B64 Regex rule against the final prompt.
-     *
-     * Sau mỗi rule, consume marker ngay lập tức.
-     *
-     * Việc này tránh rule tiếp theo lại match vào text
-     * vừa được rule trước xử lý.
+     * Newly created markers are immediately consumed after each rule.
+     * This prevents later rules from operating inside already transformed
+     * Base64 targets.
      */
     for (const script of scripts) {
         try {
@@ -230,39 +274,21 @@ function transformText(text, scripts) {
                 result,
             );
 
-            /*
-             * Example:
-             *
-             * Character Definition:
-             *
-             * Sexuality: Bisexual
-             *
-             * runRegexScript:
-             *
-             * [[b64]]Sexuality[[/b64]]: Bisexual
-             *
-             * protect:
-             *
-             * <temporary token>: Bisexual
-             */
             result = protectAndEncodeMarkers(
                 result,
                 vault,
             );
         } catch (error) {
             console.error(
-                `[${MODULE_NAME}] Failed Regex script:`,
-                script?.scriptName ?? '(unnamed)',
+                `[${MODULE_NAME}] Failed to apply Regex rule:`,
+                script?.scriptName || '(unnamed)',
                 error,
             );
         }
     }
 
-
     /*
-     * Step 3
-     *
-     * Restore placeholders thành Base64 thật.
+     * Replace all temporary placeholders with the final Base64 strings.
      */
     result = restoreProtectedMarkers(
         result,
@@ -274,18 +300,42 @@ function transformText(text, scripts) {
 
 
 /* ============================================================
- * Message content
+ * Message content handling
  * ============================================================ */
 
+/**
+ * Transforms a Chat Completion message content value.
+ *
+ * SillyTavern may use a normal string:
+ *
+ *     {
+ *         role: "system",
+ *         content: "Character description..."
+ *     }
+ *
+ * or multimodal content:
+ *
+ *     {
+ *         role: "user",
+ *         content: [
+ *             {
+ *                 type: "text",
+ *                 text: "Hello..."
+ *             },
+ *             {
+ *                 type: "image_url",
+ *                 ...
+ *             }
+ *         ]
+ *     }
+ *
+ * Only textual content is modified.
+ *
+ * @param {unknown} content
+ * @param {Array<object>} scripts
+ * @returns {unknown}
+ */
 function transformContent(content, scripts) {
-    /*
-     * Normal OpenAI-style content:
-     *
-     * {
-     *   role: "system",
-     *   content: "Character Description..."
-     * }
-     */
     if (typeof content === 'string') {
         return transformText(
             content,
@@ -293,56 +343,53 @@ function transformContent(content, scripts) {
         );
     }
 
-
-    /*
-     * Multimodal content:
-     *
-     * content: [
-     *   {
-     *     type: "text",
-     *     text: "..."
-     *   },
-     *   {
-     *     type: "image_url",
-     *     ...
-     *   }
-     * ]
-     */
-    if (Array.isArray(content)) {
-        for (const part of content) {
-            if (typeof part === 'string') {
-                const index = content.indexOf(part);
-
-                if (index !== -1) {
-                    content[index] = transformText(
-                        part,
-                        scripts,
-                    );
-                }
-
-                continue;
-            }
-
-            if (!part || typeof part !== 'object') {
-                continue;
-            }
-
-            if (typeof part.text === 'string') {
-                part.text = transformText(
-                    part.text,
-                    scripts,
-                );
-            }
-        }
-
+    if (!Array.isArray(content)) {
         return content;
     }
 
+    for (let index = 0; index < content.length; index++) {
+        const part = content[index];
+
+        /*
+         * Some providers may represent content array entries directly
+         * as strings.
+         */
+        if (typeof part === 'string') {
+            content[index] = transformText(
+                part,
+                scripts,
+            );
+
+            continue;
+        }
+
+        if (!part || typeof part !== 'object') {
+            continue;
+        }
+
+        /*
+         * OpenAI-style multimodal text part.
+         */
+        if (typeof part.text === 'string') {
+            part.text = transformText(
+                part.text,
+                scripts,
+            );
+        }
+    }
 
     return content;
 }
 
 
+/**
+ * Applies Base64 Regex transformations to every textual message in the
+ * assembled Chat Completion prompt.
+ *
+ * @param {Array<object>} messages
+ * @param {Array<object>} scripts
+ * @returns {number} Number of messages whose content changed
+ */
 function transformMessages(messages, scripts) {
     if (!Array.isArray(messages)) {
         return 0;
@@ -360,12 +407,16 @@ function transformMessages(messages, scripts) {
         }
 
         /*
-         * Debug comparison only.
+         * Keep a serialized snapshot only for change detection.
+         *
+         * This is not printed anywhere.
          */
         let before;
 
-        if (typeof message.content === 'string') {
-            before = message.content;
+        try {
+            before = JSON.stringify(message.content);
+        } catch {
+            before = null;
         }
 
         message.content = transformContent(
@@ -373,9 +424,18 @@ function transformMessages(messages, scripts) {
             scripts,
         );
 
+        let after;
+
+        try {
+            after = JSON.stringify(message.content);
+        } catch {
+            after = null;
+        }
+
         if (
-            typeof before === 'string' &&
-            before !== message.content
+            before !== null &&
+            after !== null &&
+            before !== after
         ) {
             changedMessages++;
         }
@@ -386,21 +446,31 @@ function transformMessages(messages, scripts) {
 
 
 /* ============================================================
- * Final Prompt Hook
+ * Final Chat Completion prompt hook
  * ============================================================ */
 
+/**
+ * Handles SillyTavern's CHAT_COMPLETION_PROMPT_READY event.
+ *
+ * At this stage, the Chat Completion prompt has already been assembled,
+ * which means components such as Character Description, Personality,
+ * Scenario, World Info, and chat history are available in the final
+ * message array.
+ *
+ * The extension retrieves the current Regex rules every time this event
+ * fires. This allows Regex UI changes, preset changes, and character changes
+ * to take effect automatically.
+ *
+ * Dry runs are intentionally processed as well. Base64 can change token
+ * counts, so applying the same transformation during prompt estimation keeps
+ * token calculations closer to the actual outgoing prompt.
+ *
+ * @param {object} eventData
+ * @returns {Promise<void>}
+ */
 async function onChatCompletionPromptReady(eventData) {
     try {
         if (!eventData) {
-            return;
-        }
-
-        /*
-         * Prompt Manager / token-count dry run.
-         *
-         * Không cần encode vì request thật chưa được gửi.
-         */
-        if (eventData.dryRun) {
             return;
         }
 
@@ -408,66 +478,53 @@ async function onChatCompletionPromptReady(eventData) {
 
         if (!Array.isArray(chat)) {
             console.warn(
-                `[${MODULE_NAME}] CHAT_COMPLETION_PROMPT_READY ` +
-                'did not contain eventData.chat.',
+                `[${MODULE_NAME}] CHAT_COMPLETION_PROMPT_READY did not contain a valid chat array.`,
             );
 
             return;
         }
 
-
         /*
-         * Đây chính là "API list all regex" bạn muốn.
+         * Retrieve the active Base64 Regex rules for every generation.
          *
-         * Nó được gọi MỖI generation.
-         *
-         * Vì thế:
-         *
-         * - thêm Regex mới => tự nhận
-         * - sửa Regex => tự nhận
-         * - đổi preset => tự nhận
-         * - đổi character => tự nhận
-         *
-         * Không phải restart extension.
+         * There is deliberately no cached keyword list in this extension.
          */
         const scripts = getBase64RegexScripts();
 
         if (scripts.length === 0) {
             if (DEBUG) {
                 console.debug(
-                    `[${MODULE_NAME}] No active [[b64]] Regex rules found.`,
+                    `[${MODULE_NAME}] No active [[b64]] Regex rules were found.`,
                 );
             }
 
             return;
         }
 
-
         if (DEBUG) {
             console.debug(
-                `[${MODULE_NAME}] Reapplying ${scripts.length} B64 Regex rule(s) to final prompt:`,
-                scripts.map((script) =>
-                    script.scriptName || '(unnamed)',
+                `[${MODULE_NAME}] Applying ${scripts.length} Base64 Regex rule(s) to the final prompt.`,
+                scripts.map(
+                    script => script.scriptName || '(unnamed)',
                 ),
             );
         }
 
-
-        const changedMessages =
-            transformMessages(
-                chat,
-                scripts,
-            );
-
-
-        console.info(
-            `[${MODULE_NAME}] Done. ` +
-            `${scripts.length} B64 Regex rule(s), ` +
-            `${changedMessages} final prompt message(s) changed.`,
+        const changedMessages = transformMessages(
+            chat,
+            scripts,
         );
+
+        if (DEBUG) {
+            console.info(
+                `[${MODULE_NAME}] Transformation complete. ` +
+                `${changedMessages} message(s) changed. ` +
+                `Dry run: ${Boolean(eventData.dryRun)}.`,
+            );
+        }
     } catch (error) {
         console.error(
-            `[${MODULE_NAME}] Failed to process final prompt:`,
+            `[${MODULE_NAME}] Failed to transform the final prompt:`,
             error,
         );
     }
@@ -475,7 +532,7 @@ async function onChatCompletionPromptReady(eventData) {
 
 
 /* ============================================================
- * Init
+ * Extension initialization
  * ============================================================ */
 
 const {
@@ -489,7 +546,7 @@ if (
     !event_types?.CHAT_COMPLETION_PROMPT_READY
 ) {
     console.error(
-        `[${MODULE_NAME}] CHAT_COMPLETION_PROMPT_READY is unavailable.`,
+        `[${MODULE_NAME}] CHAT_COMPLETION_PROMPT_READY is not available.`,
     );
 } else {
     eventSource.on(
@@ -499,6 +556,6 @@ if (
 
     console.log(
         `[${MODULE_NAME}] Loaded. ` +
-        'B64 Regex rules will be reapplied to the final Chat Completion prompt.',
+        'Regex rules containing [[b64]] markers will be reapplied to the final Chat Completion prompt.',
     );
 }
