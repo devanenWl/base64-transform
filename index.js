@@ -36,33 +36,56 @@ const DEBUG = true;
  *
  *     SillyTavern > Extensions > Base64PromptTransform
  *
- * Messages that contain Base64-encoded content are rewritten as a
- * tool-call pair in the final prompt:
+ * IMPORTANT:
  *
- *     assistant message with tool_calls
- *     tool message containing the encoded content
+ * Only historical ASSISTANT messages containing Base64-transformed
+ * content are eligible for tool-call wrapping.
  *
- * Empirical testing against the upstream provider showed this combination
- * (Base64 encoding + tool message wrapping) passes the provider's content
- * filter reliably, even for large explicit histories that fail with
- * Base64 encoding alone.
+ * User messages are NEVER rewritten as assistant/tool messages because
+ * doing so changes the semantic author of the conversation turn.
  *
- * The final message of the prompt (the current user turn) is never wrapped.
+ * Example preserved user message:
+ *
+ *     {
+ *         role: "user",
+ *         content: "Some dHJhbnNmb3JtZWQ= content"
+ *     }
+ *
+ * Example wrapped assistant message:
+ *
+ *     {
+ *         role: "assistant",
+ *         content: null,
+ *         tool_calls: [...]
+ *     }
+ *
+ *     {
+ *         role: "tool",
+ *         tool_call_id: "...",
+ *         content: "Some dHJhbnNmb3JtZWQ= content"
+ *     }
+ *
+ * The final message of the prompt is also never wrapped.
  */
 let toolWrapEnabled = true;
 
 /**
- * Tool name used in the fabricated tool-call pairs. The model does not need
- * to know this tool; it is only a container for the history content.
+ * Tool name used in fabricated assistant tool-call pairs.
+ *
+ * The model does not need an actual implementation of this tool because
+ * the tool call and its result already exist in the supplied history.
  */
 const TOOL_NAME = 'story_log';
 
 /**
- * A message is considered Base64-heavy (and therefore wrapped) when its
- * text contains at least one padded Base64 token.
+ * A message is considered Base64-bearing when its text contains at least
+ * one padded Base64-looking token.
  *
- * Messages that survive the Regex pass without any flagged words remain
- * untouched.
+ * NOTE:
+ * This is only used to decide whether an assistant history message should
+ * be wrapped.
+ *
+ * User messages are never wrapped regardless of this regex.
  */
 const B64_TOKEN_RE = /[A-Za-z0-9+/]{8,}={1,2}/;
 
@@ -110,7 +133,7 @@ function encodeBase64Utf8(text) {
  * Example:
  *
  *     Find Regex:
- *     /\b(?:sexuality|violence|weapons?)\b/gi
+ *     /\b(?:example|words?)\b/gi
  *
  *     Replace With:
  *     [[b64]]{{match}}[[/b64]]
@@ -170,18 +193,18 @@ function getBase64RegexScripts() {
  *
  * For example:
  *
- *     violence
+ *     example
  *
  * may already be:
  *
- *     [[b64]]violence[[/b64]]
+ *     [[b64]]example[[/b64]]
  *
  * before this extension receives the final prompt.
  *
  * If the same Regex rule were applied again without protection, it could
  * produce nested markers such as:
  *
- *     [[b64]][[b64]]violence[[/b64]][[/b64]]
+ *     [[b64]][[b64]]example[[/b64]][[/b64]]
  *
  * To prevent this:
  *
@@ -426,6 +449,17 @@ function transformContent(content, scripts) {
  * Applies Base64 Regex transformations to every textual message in the
  * assembled Chat Completion prompt.
  *
+ * IMPORTANT:
+ *
+ * This transformation does NOT change message roles.
+ *
+ * A user message stays a user message.
+ * An assistant message stays an assistant message.
+ * A system message stays a system message.
+ *
+ * Tool wrapping, if enabled, happens separately afterwards and is restricted
+ * to assistant history messages only.
+ *
  * @param {Array<object>} messages
  * @param {Array<object>} scripts
  * @returns {number} Number of messages whose content changed
@@ -508,7 +542,11 @@ function contentToString(content) {
                     return part;
                 }
 
-                if (part && typeof part.text === 'string') {
+                if (
+                    part &&
+                    typeof part === 'object' &&
+                    typeof part.text === 'string'
+                ) {
                     return part.text;
                 }
 
@@ -523,15 +561,32 @@ function contentToString(content) {
 
 
 /**
- * Determines whether a historical message should be rewritten as a
- * tool-call pair.
+ * Determines whether a historical ASSISTANT message should be rewritten
+ * as a tool-call pair.
  *
- * A message is wrapped when it is a user/assistant message that:
- * - is not the final message of the prompt (the current turn), and
- * - contains Base64-encoded content (i.e. the Regex pass modified it).
+ * User messages are NEVER wrapped.
  *
- * System messages and messages that already contain tool_calls are
- * never wrapped.
+ * This is intentional because converting:
+ *
+ *     {
+ *         role: "user",
+ *         content: "..."
+ *     }
+ *
+ * into:
+ *
+ *     assistant(tool_calls)
+ *     -> tool(content)
+ *
+ * changes the semantic author of the original turn.
+ *
+ * A message is eligible only when:
+ *
+ * - Tool-call wrapping is enabled.
+ * - It is not the final message of the prompt.
+ * - role === "assistant".
+ * - It does not already contain tool_calls.
+ * - It contains Base64-looking content.
  *
  * @param {object} message
  * @param {boolean} isLast
@@ -542,18 +597,31 @@ function shouldWrapMessage(message, isLast) {
         return false;
     }
 
+    /*
+     * Never touch the current/final turn.
+     */
     if (isLast) {
         return false;
     }
 
+    /*
+     * CRITICAL:
+     *
+     * Only assistant messages can become assistant -> tool pairs.
+     *
+     * User messages must remain role: "user".
+     */
     if (
         !message ||
         typeof message !== 'object' ||
-        (message.role !== 'assistant' && message.role !== 'user')
+        message.role !== 'assistant'
     ) {
         return false;
     }
 
+    /*
+     * Do not interfere with genuine/existing tool calls.
+     */
     if (message.tool_calls) {
         return false;
     }
@@ -569,19 +637,45 @@ function shouldWrapMessage(message, isLast) {
 
 
 /**
- * Rewrites Base64-bearing historical messages as tool-call pairs:
+ * Rewrites Base64-bearing historical ASSISTANT messages as tool-call pairs:
  *
- *     { role: "assistant", content: null, tool_calls: [...] }
- *     { role: "tool", tool_call_id: "...", content: "..." }
+ * Original:
  *
- * The final message of the prompt (the current user turn) is preserved
- * as-is, as are system messages and already-tool-calling messages.
+ *     {
+ *         role: "assistant",
+ *         content: "..."
+ *     }
+ *
+ * becomes:
+ *
+ *     {
+ *         role: "assistant",
+ *         content: null,
+ *         tool_calls: [...]
+ *     }
+ *
+ *     {
+ *         role: "tool",
+ *         tool_call_id: "...",
+ *         content: "..."
+ *     }
+ *
+ * USER MESSAGES ARE NEVER WRAPPED.
+ *
+ * Even if a user message contains Base64, it remains:
+ *
+ *     {
+ *         role: "user",
+ *         content: "..."
+ *     }
+ *
+ * The final message of the prompt is also preserved as-is.
  *
  * The chat array is mutated in place so SillyTavern sends the rewritten
  * prompt.
  *
  * @param {Array<object>} chat
- * @returns {number} Number of wrapped messages
+ * @returns {number} Number of wrapped assistant messages
  */
 function wrapMessagesAsToolPairs(chat) {
     if (!toolWrapEnabled || !Array.isArray(chat)) {
@@ -589,22 +683,42 @@ function wrapMessagesAsToolPairs(chat) {
     }
 
     const wrapped = [];
+
     let callIndex = 0;
     let wrappedMessages = 0;
 
     for (let index = 0; index < chat.length; index++) {
         const message = chat[index];
+        const isLast = index === chat.length - 1;
 
-        if (shouldWrapMessage(message, index === chat.length - 1)) {
+        /*
+         * Defensive role-preservation guard.
+         *
+         * Even if shouldWrapMessage() is accidentally changed in the future,
+         * user messages still cannot be converted here.
+         */
+        if (
+            message &&
+            typeof message === 'object' &&
+            message.role === 'user'
+        ) {
+            wrapped.push(message);
+
+            continue;
+        }
+
+        if (shouldWrapMessage(message, isLast)) {
             callIndex += 1;
             wrappedMessages += 1;
+
+            const callId = `call_${callIndex}`;
 
             wrapped.push({
                 role: 'assistant',
                 content: null,
                 tool_calls: [
                     {
-                        id: `call_${callIndex}`,
+                        id: callId,
                         type: 'function',
                         function: {
                             name: TOOL_NAME,
@@ -616,19 +730,38 @@ function wrapMessagesAsToolPairs(chat) {
 
             wrapped.push({
                 role: 'tool',
-                tool_call_id: `call_${callIndex}`,
+                tool_call_id: callId,
                 content: contentToString(message.content),
             });
-        } else {
-            wrapped.push(message);
+
+            continue;
         }
+
+        /*
+         * Everything else is preserved exactly as-is.
+         *
+         * Includes:
+         * - user
+         * - system
+         * - tool
+         * - assistant without Base64
+         * - assistant with existing tool_calls
+         * - final/current message
+         */
+        wrapped.push(message);
     }
 
     /*
-     * Mutate in place: SillyTavern may hold a reference to the original
-     * array and use it to build the outgoing request.
+     * Mutate in place.
+     *
+     * SillyTavern may retain the original array reference and later use
+     * that same reference when constructing the outgoing provider request.
      */
-    chat.splice(0, chat.length, ...wrapped);
+    chat.splice(
+        0,
+        chat.length,
+        ...wrapped,
+    );
 
     return wrappedMessages;
 }
@@ -654,6 +787,13 @@ function wrapMessagesAsToolPairs(chat) {
  * counts, so applying the same transformation during prompt estimation keeps
  * token calculations closer to the actual outgoing prompt.
  *
+ * Processing order:
+ *
+ * 1. Apply [[b64]] Regex transformations.
+ * 2. Preserve every original message role.
+ * 3. Optionally wrap historical ASSISTANT Base64 messages.
+ * 4. Never wrap user messages.
+ *
  * @param {object} eventData
  * @returns {Promise<void>}
  */
@@ -674,7 +814,7 @@ async function onChatCompletionPromptReady(eventData) {
         }
 
         /*
-         * Retrieve the active Base64 Regex rules for every generation.
+         * Retrieve active Base64 Regex rules for every generation.
          *
          * There is deliberately no cached keyword list in this extension.
          */
@@ -703,19 +843,28 @@ async function onChatCompletionPromptReady(eventData) {
         }
 
         /*
-         * Wrap Base64-bearing history messages as tool-call pairs.
+         * Wrap Base64-bearing historical ASSISTANT messages.
          *
-         * This runs even when no [[b64]] rules are active, so content that
-         * was already Base64-encoded by earlier regex passes is still
-         * protected.
+         * User messages are intentionally excluded and preserve role:user.
+         *
+         * This runs even when no [[b64]] rules are active so historical
+         * assistant content that was already Base64-encoded by an earlier
+         * regex stage can still be detected.
          */
         const wrappedMessages = wrapMessagesAsToolPairs(chat);
 
-        if (DEBUG && (changedMessages > 0 || wrappedMessages > 0)) {
+        if (
+            DEBUG &&
+            (
+                changedMessages > 0 ||
+                wrappedMessages > 0
+            )
+        ) {
             console.info(
                 `[${MODULE_NAME}] Transformation complete. ` +
                 `${changedMessages} message(s) Base64-encoded, ` +
-                `${wrappedMessages} message(s) wrapped as tool calls. ` +
+                `${wrappedMessages} assistant message(s) wrapped as tool calls. ` +
+                `User roles preserved. ` +
                 `Dry run: ${Boolean(eventData.dryRun)}.`,
             );
         }
@@ -742,7 +891,7 @@ const {
 } = context;
 
 /**
- * Namespace used inside the global `extensionSettings` object so this
+ * Namespace used inside the global extensionSettings object so this
  * extension's keys never collide with other extensions.
  */
 const EXTENSION_SETTINGS_KEY = 'Base64PromptTransform';
@@ -751,7 +900,10 @@ const EXTENSION_SETTINGS_KEY = 'Base64PromptTransform';
  * Returns this extension's persistent settings object, creating it
  * on first access.
  *
- * The object is stored under extensionSettings["Base64PromptTransform"]
+ * The object is stored under:
+ *
+ *     extensionSettings["Base64PromptTransform"]
+ *
  * and persisted by SillyTavern via saveSettingsDebounced().
  *
  * @returns {Record<string, unknown>}
@@ -764,8 +916,9 @@ function getExtensionSettings() {
     return extensionSettings[EXTENSION_SETTINGS_KEY];
 }
 
+
 /**
- * Loads the stored "Tool-call wrapping" preference from the persistent
+ * Loads the stored "Tool-call wrapping" preference from persistent
  * extension settings.
  */
 function loadToolWrapSetting() {
@@ -783,45 +936,95 @@ function loadToolWrapSetting() {
     }
 }
 
+
 /**
  * Registers the extension settings panel.
  *
  * The panel is appended to SillyTavern's standard extensions settings
- * container (`#extensions_settings2`), which is rendered inside:
+ * container:
  *
- *     SillyTavern > Extensions (puzzle piece) > Extensions > Settings
+ *     #extensions_settings2
  *
- * The inline-drawer pattern matches how built-in extensions render their
- * settings, and the checkbox state is persisted through the normal
- * extensionSettings mechanism.
+ * which is normally rendered inside:
+ *
+ *     SillyTavern
+ *       > Extensions
+ *       > Extensions
+ *       > Settings
+ *
+ * The checkbox controls whether historical assistant messages containing
+ * Base64-looking content may be represented as tool-call history.
+ *
+ * User messages are never wrapped regardless of this setting.
  */
 function registerExtensionSettingsPanel() {
+    /*
+     * Load persisted value BEFORE rendering the checkbox so the initial
+     * checked state is correct.
+     */
+    loadToolWrapSetting();
+
     const container = $('#extensions_settings2');
 
     if (!container || container.length === 0) {
         console.warn(
             `[${MODULE_NAME}] #extensions_settings2 was not found. ` +
-            'The settings panel will not be rendered; the source default is used.',
+            'The settings panel will not be rendered; the stored/source default is used.',
+        );
+
+        return;
+    }
+
+    /*
+     * Avoid duplicate panels if extension initialization somehow runs more
+     * than once.
+     */
+    if ($('#b64pt_settings_panel').length > 0) {
+        $('#b64pt_tool_wrap').prop(
+            'checked',
+            toolWrapEnabled,
         );
 
         return;
     }
 
     const panelHtml = `
-        <div class="inline-drawer b64pt-drawer">
+        <div
+            id="b64pt_settings_panel"
+            class="inline-drawer b64pt-drawer"
+        >
             <div class="inline-drawer-toggle inline-drawer-header">
-                <b data-i18n="Base64PromptTransform">Base64PromptTransform</b>
-                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                <b data-i18n="Base64PromptTransform">
+                    Base64PromptTransform
+                </b>
+
+                <div
+                    class="inline-drawer-icon fa-solid fa-circle-chevron-down down"
+                ></div>
             </div>
+
             <div class="inline-drawer-content">
-                <label class="checkbox_label" for="b64pt_tool_wrap">
-                    <input id="b64pt_tool_wrap" type="checkbox" ${toolWrapEnabled ? 'checked' : ''} />
-                    <span data-i18n="Tool-call wrapping">Tool-call wrapping</span>
+                <label
+                    class="checkbox_label"
+                    for="b64pt_tool_wrap"
+                >
+                    <input
+                        id="b64pt_tool_wrap"
+                        type="checkbox"
+                        ${toolWrapEnabled ? 'checked' : ''}
+                    />
+
+                    <span data-i18n="Tool-call wrapping">
+                        Tool-call wrapping
+                    </span>
                 </label>
-                <small data-i18n="Rewrite Base64-bearing history messages as tool-call pairs in the final prompt. Together with [[b64]] Regex encoding this reliably passes the upstream content filter, even for large explicit histories. Disable to send a plain prompt instead.">
-                    Rewrite Base64-bearing history messages as tool-call pairs in the final prompt.
-                    Together with [[b64]] Regex encoding this reliably passes the upstream content filter,
-                    even for large explicit histories. Disable to send a plain prompt instead.
+
+                <small>
+                    Rewrite Base64-bearing historical
+                    <strong>assistant</strong> messages as tool-call pairs.
+                    User messages always remain
+                    <code>role: "user"</code>.
+                    Disable this option to keep assistant messages plain too.
                 </small>
             </div>
         </div>
@@ -829,30 +1032,39 @@ function registerExtensionSettingsPanel() {
 
     container.append(panelHtml);
 
-    $('#b64pt_tool_wrap').on('change', function () {
-        toolWrapEnabled = $(this).prop('checked');
+    $('#b64pt_tool_wrap').on(
+        'change',
+        function () {
+            toolWrapEnabled = Boolean(
+                $(this).prop('checked'),
+            );
 
-        getExtensionSettings().tool_wrap = toolWrapEnabled;
+            getExtensionSettings().tool_wrap =
+                toolWrapEnabled;
 
-        saveSettingsDebounced();
+            saveSettingsDebounced();
 
-        console.info(
-            `[${MODULE_NAME}] Tool-call wrapping set to ${toolWrapEnabled ? 'enabled' : 'disabled'}.`,
-        );
-    });
+            console.info(
+                `[${MODULE_NAME}] Tool-call wrapping set to ` +
+                `${toolWrapEnabled ? 'enabled' : 'disabled'}. ` +
+                'User messages are never wrapped.',
+            );
+        },
+    );
 
     /*
-     * Pick up a previously stored value immediately, before the user
-     * opens the settings panel.
+     * Keep checkbox synchronized with loaded setting.
      */
-    loadToolWrapSetting();
-
-    /*
-     * Keep the checkbox in sync with the stored value (e.g. after a
-     * settings import).
-     */
-    $('#b64pt_tool_wrap').prop('checked', toolWrapEnabled);
+    $('#b64pt_tool_wrap').prop(
+        'checked',
+        toolWrapEnabled,
+    );
 }
+
+
+/* ============================================================
+ * Start extension
+ * ============================================================ */
 
 registerExtensionSettingsPanel();
 
@@ -872,6 +1084,7 @@ if (
     console.log(
         `[${MODULE_NAME}] Loaded. ` +
         'Regex rules containing [[b64]] markers will be reapplied to the final Chat Completion prompt. ' +
-        `Tool-call wrapping: ${toolWrapEnabled ? 'enabled' : 'disabled'}.`,
+        'User message roles are always preserved. ' +
+        `Assistant tool-call wrapping: ${toolWrapEnabled ? 'enabled' : 'disabled'}.`,
     );
 }
