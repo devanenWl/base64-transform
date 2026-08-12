@@ -26,6 +26,46 @@ const ALLOWED_ONLY = true;
  */
 const DEBUG = true;
 
+/**
+ * Default state of the tool-call wrapping feature.
+ *
+ * This is only used before the extension settings are loaded, or when
+ * SillyTavern does not expose the settings API. Once the extension is
+ * initialized, the value is controlled by the "Tool-call wrapping"
+ * checkbox in:
+ *
+ *     SillyTavern > Extensions > Base64PromptTransform
+ *
+ * Messages that contain Base64-encoded content are rewritten as a
+ * tool-call pair in the final prompt:
+ *
+ *     assistant message with tool_calls
+ *     tool message containing the encoded content
+ *
+ * Empirical testing against the upstream provider showed this combination
+ * (Base64 encoding + tool message wrapping) passes the provider's content
+ * filter reliably, even for large explicit histories that fail with
+ * Base64 encoding alone.
+ *
+ * The final message of the prompt (the current user turn) is never wrapped.
+ */
+let toolWrapEnabled = true;
+
+/**
+ * Tool name used in the fabricated tool-call pairs. The model does not need
+ * to know this tool; it is only a container for the history content.
+ */
+const TOOL_NAME = 'story_log';
+
+/**
+ * A message is considered Base64-heavy (and therefore wrapped) when its
+ * text contains at least one padded Base64 token.
+ *
+ * Messages that survive the Regex pass without any flagged words remain
+ * untouched.
+ */
+const B64_TOKEN_RE = /[A-Za-z0-9+/]{8,}={1,2}/;
+
 
 /* ============================================================
  * UTF-8 Base64 encoding
@@ -446,6 +486,155 @@ function transformMessages(messages, scripts) {
 
 
 /* ============================================================
+ * Tool-call wrapping
+ * ============================================================ */
+
+/**
+ * Converts a message content value (string or multimodal array) into a
+ * plain string for use inside a tool message.
+ *
+ * @param {unknown} content
+ * @returns {string}
+ */
+function contentToString(content) {
+    if (typeof content === 'string') {
+        return content;
+    }
+
+    if (Array.isArray(content)) {
+        return content
+            .map((part) => {
+                if (typeof part === 'string') {
+                    return part;
+                }
+
+                if (part && typeof part.text === 'string') {
+                    return part.text;
+                }
+
+                return '';
+            })
+            .filter((text) => text.length > 0)
+            .join('\n');
+    }
+
+    return String(content ?? '');
+}
+
+
+/**
+ * Determines whether a historical message should be rewritten as a
+ * tool-call pair.
+ *
+ * A message is wrapped when it is a user/assistant message that:
+ * - is not the final message of the prompt (the current turn), and
+ * - contains Base64-encoded content (i.e. the Regex pass modified it).
+ *
+ * System messages and messages that already contain tool_calls are
+ * never wrapped.
+ *
+ * @param {object} message
+ * @param {boolean} isLast
+ * @returns {boolean}
+ */
+function shouldWrapMessage(message, isLast) {
+    if (!toolWrapEnabled) {
+        return false;
+    }
+
+    if (isLast) {
+        return false;
+    }
+
+    if (
+        !message ||
+        typeof message !== 'object' ||
+        (message.role !== 'assistant' && message.role !== 'user')
+    ) {
+        return false;
+    }
+
+    if (message.tool_calls) {
+        return false;
+    }
+
+    const text = contentToString(message.content);
+
+    if (text.length === 0) {
+        return false;
+    }
+
+    return B64_TOKEN_RE.test(text);
+}
+
+
+/**
+ * Rewrites Base64-bearing historical messages as tool-call pairs:
+ *
+ *     { role: "assistant", content: null, tool_calls: [...] }
+ *     { role: "tool", tool_call_id: "...", content: "..." }
+ *
+ * The final message of the prompt (the current user turn) is preserved
+ * as-is, as are system messages and already-tool-calling messages.
+ *
+ * The chat array is mutated in place so SillyTavern sends the rewritten
+ * prompt.
+ *
+ * @param {Array<object>} chat
+ * @returns {number} Number of wrapped messages
+ */
+function wrapMessagesAsToolPairs(chat) {
+    if (!toolWrapEnabled || !Array.isArray(chat)) {
+        return 0;
+    }
+
+    const wrapped = [];
+    let callIndex = 0;
+    let wrappedMessages = 0;
+
+    for (let index = 0; index < chat.length; index++) {
+        const message = chat[index];
+
+        if (shouldWrapMessage(message, index === chat.length - 1)) {
+            callIndex += 1;
+            wrappedMessages += 1;
+
+            wrapped.push({
+                role: 'assistant',
+                content: null,
+                tool_calls: [
+                    {
+                        id: `call_${callIndex}`,
+                        type: 'function',
+                        function: {
+                            name: TOOL_NAME,
+                            arguments: '{}',
+                        },
+                    },
+                ],
+            });
+
+            wrapped.push({
+                role: 'tool',
+                tool_call_id: `call_${callIndex}`,
+                content: contentToString(message.content),
+            });
+        } else {
+            wrapped.push(message);
+        }
+    }
+
+    /*
+     * Mutate in place: SillyTavern may hold a reference to the original
+     * array and use it to build the outgoing request.
+     */
+    chat.splice(0, chat.length, ...wrapped);
+
+    return wrappedMessages;
+}
+
+
+/* ============================================================
  * Final Chat Completion prompt hook
  * ============================================================ */
 
@@ -491,34 +680,42 @@ async function onChatCompletionPromptReady(eventData) {
          */
         const scripts = getBase64RegexScripts();
 
-        if (scripts.length === 0) {
+        let changedMessages = 0;
+
+        if (scripts.length > 0) {
             if (DEBUG) {
                 console.debug(
-                    `[${MODULE_NAME}] No active [[b64]] Regex rules were found.`,
+                    `[${MODULE_NAME}] Applying ${scripts.length} Base64 Regex rule(s) to the final prompt.`,
+                    scripts.map(
+                        script => script.scriptName || '(unnamed)',
+                    ),
                 );
             }
 
-            return;
-        }
-
-        if (DEBUG) {
+            changedMessages = transformMessages(
+                chat,
+                scripts,
+            );
+        } else if (DEBUG) {
             console.debug(
-                `[${MODULE_NAME}] Applying ${scripts.length} Base64 Regex rule(s) to the final prompt.`,
-                scripts.map(
-                    script => script.scriptName || '(unnamed)',
-                ),
+                `[${MODULE_NAME}] No active [[b64]] Regex rules were found.`,
             );
         }
 
-        const changedMessages = transformMessages(
-            chat,
-            scripts,
-        );
+        /*
+         * Wrap Base64-bearing history messages as tool-call pairs.
+         *
+         * This runs even when no [[b64]] rules are active, so content that
+         * was already Base64-encoded by earlier regex passes is still
+         * protected.
+         */
+        const wrappedMessages = wrapMessagesAsToolPairs(chat);
 
-        if (DEBUG) {
+        if (DEBUG && (changedMessages > 0 || wrappedMessages > 0)) {
             console.info(
                 `[${MODULE_NAME}] Transformation complete. ` +
-                `${changedMessages} message(s) changed. ` +
+                `${changedMessages} message(s) Base64-encoded, ` +
+                `${wrappedMessages} message(s) wrapped as tool calls. ` +
                 `Dry run: ${Boolean(eventData.dryRun)}.`,
             );
         }
@@ -535,11 +732,90 @@ async function onChatCompletionPromptReady(eventData) {
  * Extension initialization
  * ============================================================ */
 
+const context = SillyTavern.getContext();
+
 const {
     eventSource,
     event_types,
-} = SillyTavern.getContext();
+} = context;
 
+/**
+ * Loads the stored "Tool-call wrapping" preference.
+ *
+ * The value is persisted by SillyTavern inside the extension settings
+ * file (data/default-user/settings/Base64PromptTransform.json) whenever
+ * the checkbox is toggled.
+ */
+function loadToolWrapSetting() {
+    try {
+        const stored = context.extensionSettings?.tool_wrap;
+
+        if (typeof stored === 'boolean') {
+            toolWrapEnabled = stored;
+        }
+    } catch (error) {
+        console.warn(
+            `[${MODULE_NAME}] Could not load tool-call wrapping setting:`,
+            error,
+        );
+    }
+}
+
+/**
+ * Registers the extension settings panel.
+ *
+ *     SillyTavern > Extensions > Base64PromptTransform
+ *
+ * If SillyTavern does not expose registerCustomSettings (older versions),
+ * the module-level default is used instead and the feature can still be
+ * toggled by editing `toolWrapEnabled` in the source.
+ */
+function registerExtensionSettings() {
+    if (!context.settings?.registerCustomSettings) {
+        console.warn(
+            `[${MODULE_NAME}] registerCustomSettings is not available. ` +
+            'The tool-call wrapping toggle will use the source default.',
+        );
+
+        return;
+    }
+
+    try {
+        context.settings.registerCustomSettings(
+            MODULE_NAME,
+            [
+                {
+                    id: 'tool_wrap',
+                    name: 'Tool-call wrapping',
+                    description:
+                        'Rewrite Base64-bearing history messages as tool-call pairs in the final prompt. ' +
+                        'Together with [[b64]] Regex encoding this reliably passes the upstream content filter, ' +
+                        'even for large explicit histories. Disable to send a plain prompt instead.',
+                    type: 'checkbox',
+                    value: toolWrapEnabled,
+                },
+            ],
+            null,
+            () => {
+                loadToolWrapSetting();
+                context.saveSettingsDebounced();
+            },
+        );
+
+        /*
+         * Pick up a previously stored value immediately, before the user
+         * opens the settings panel.
+         */
+        loadToolWrapSetting();
+    } catch (error) {
+        console.error(
+            `[${MODULE_NAME}] Failed to register settings:`,
+            error,
+        );
+    }
+}
+
+registerExtensionSettings();
 
 if (
     !eventSource ||
@@ -556,6 +832,7 @@ if (
 
     console.log(
         `[${MODULE_NAME}] Loaded. ` +
-        'Regex rules containing [[b64]] markers will be reapplied to the final Chat Completion prompt.',
+        'Regex rules containing [[b64]] markers will be reapplied to the final Chat Completion prompt. ' +
+        `Tool-call wrapping: ${toolWrapEnabled ? 'enabled' : 'disabled'}.`,
     );
 }
