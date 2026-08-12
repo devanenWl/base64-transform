@@ -260,6 +260,566 @@ function encodeBase64Utf8(text) {
 
 
 /* ============================================================
+ * UTF-8 Base64 decoding / incoming post-processing
+ * ============================================================ */
+
+/**
+ * Minimum size for a bare Base64 candidate.
+ *
+ * Short candidates are substantially more prone to false positives.
+ * Explicit [[b64]] markers don't use this restriction.
+ */
+const MIN_BARE_B64_LENGTH = 4;
+
+/**
+ * Bare Base64 / Base64URL token detector.
+ *
+ * Supports:
+ *   Y29jaw==
+ *   Y29jaw
+ *   SGVsbG8td29ybGQ_
+ *
+ * Boundaries intentionally exclude characters that may legally occur
+ * inside Base64/Base64URL tokens.
+ */
+const BARE_B64_DECODE_RE =
+    /(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{4,}={0,2}(?![A-Za-z0-9+/_=-])/g;
+
+/**
+ * Marker detector.
+ */
+const B64_MARKER_RE =
+    /\[\[b64\]\]([\s\S]*?)\[\[\/b64\]\]/gi;
+
+
+/**
+ * Converts Base64URL characters to standard Base64 and restores padding.
+ *
+ * Returns null for structurally impossible values.
+ *
+ * @param {string} input
+ * @param {boolean} [allowWhitespace=false]
+ * @returns {string|null}
+ */
+function normalizeBase64(input, allowWhitespace = false) {
+    if (typeof input !== 'string') {
+        return null;
+    }
+
+    let value = input.trim();
+
+    if (allowWhitespace) {
+        value = value.replace(/\s+/g, '');
+    } else if (/\s/.test(value)) {
+        return null;
+    }
+
+    if (value.length === 0) {
+        return null;
+    }
+
+    /*
+     * URL-safe Base64 -> standard Base64.
+     */
+    value = value
+        .replace(/-/g, '+')
+        .replace(/_/g, '/');
+
+    /*
+     * Padding may only occur at the end.
+     */
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
+        return null;
+    }
+
+    const firstPadding = value.indexOf('=');
+
+    if (
+        firstPadding !== -1 &&
+        /[^=]/.test(value.slice(firstPadding))
+    ) {
+        return null;
+    }
+
+    /*
+     * Remove supplied padding and reconstruct canonical padding ourselves.
+     */
+    value = value.replace(/=+$/g, '');
+
+    /*
+     * Base64 length mod 4 == 1 is impossible.
+     */
+    if (value.length % 4 === 1) {
+        return null;
+    }
+
+    value += '='.repeat(
+        (4 - (value.length % 4)) % 4,
+    );
+
+    return value;
+}
+
+
+/**
+ * Decodes normalized Base64 to UTF-8.
+ *
+ * Fatal TextDecoder mode is important: arbitrary binary that merely happens
+ * to be legal Base64 is rejected.
+ *
+ * @param {string} normalized
+ * @returns {string}
+ */
+function decodeNormalizedBase64Utf8(normalized) {
+    const binary = atob(normalized);
+
+    const bytes = Uint8Array.from(
+        binary,
+        char => char.charCodeAt(0),
+    );
+
+    return new TextDecoder(
+        'utf-8',
+        { fatal: true },
+    ).decode(bytes);
+}
+
+
+/**
+ * Reject strings containing binary/control garbage.
+ *
+ * Newline, carriage return and tab are accepted because marker-wrapped
+ * Base64 may legitimately represent larger text blocks.
+ *
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isPrintableDecodedText(text) {
+    if (
+        typeof text !== 'string' ||
+        text.length === 0
+    ) {
+        return false;
+    }
+
+    for (const char of text) {
+        const code = char.codePointAt(0);
+
+        if (
+            code === 0x09 ||
+            code === 0x0A ||
+            code === 0x0D
+        ) {
+            continue;
+        }
+
+        /*
+         * C0 controls.
+         */
+        if (code < 0x20) {
+            return false;
+        }
+
+        /*
+         * DEL + C1 controls.
+         */
+        if (code >= 0x7F && code <= 0x9F) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+/**
+ * Converts Base64 to a padding-independent canonical form.
+ *
+ * Base64URL has already been normalized before this is called.
+ *
+ * @param {string} encoded
+ * @returns {string}
+ */
+function stripBase64Padding(encoded) {
+    return encoded.replace(/=+$/g, '');
+}
+
+
+/**
+ * Attempts to decode Base64/Base64URL text.
+ *
+ * Protections:
+ *
+ * 1. Validate structure.
+ * 2. Restore missing padding.
+ * 3. Decode using fatal UTF-8.
+ * 4. Reject control/binary output.
+ * 5. Re-encode decoded text and require a canonical round trip.
+ *
+ * `allowWhitespace` is useful for explicit [[b64]] blocks.
+ *
+ * @param {string} candidate
+ * @param {{allowWhitespace?: boolean}} [options]
+ * @returns {string|null}
+ */
+function tryDecodeBase64Utf8(
+    candidate,
+    {
+        allowWhitespace = false,
+    } = {},
+) {
+    if (typeof candidate !== 'string') {
+        return null;
+    }
+
+    const original = allowWhitespace
+        ? candidate.trim().replace(/\s+/g, '')
+        : candidate.trim();
+
+    const normalized = normalizeBase64(
+        original,
+        allowWhitespace,
+    );
+
+    if (!normalized) {
+        return null;
+    }
+
+    let decoded;
+
+    try {
+        decoded = decodeNormalizedBase64Utf8(
+            normalized,
+        );
+    } catch {
+        return null;
+    }
+
+    if (!isPrintableDecodedText(decoded)) {
+        return null;
+    }
+
+    /*
+     * Strong canonical round-trip validation.
+     */
+    const reencoded = encodeBase64Utf8(decoded);
+
+    const normalizedOriginalWithoutPadding =
+        stripBase64Padding(normalized);
+
+    const reencodedWithoutPadding =
+        stripBase64Padding(reencoded);
+
+    if (
+        normalizedOriginalWithoutPadding !==
+        reencodedWithoutPadding
+    ) {
+        return null;
+    }
+
+    return decoded;
+}
+
+
+/**
+ * Determines whether a bare candidate has enough evidence to be decoded.
+ *
+ * Explicit markers do not need these heuristics.
+ *
+ * @param {string} candidate
+ * @param {string} decoded
+ * @returns {boolean}
+ */
+function isStrongBareBase64Candidate(
+    candidate,
+    decoded,
+) {
+    if (
+        typeof candidate !== 'string' ||
+        typeof decoded !== 'string'
+    ) {
+        return false;
+    }
+
+    if (candidate.length < MIN_BARE_B64_LENGTH) {
+        return false;
+    }
+
+    /*
+     * Padding is a strong Base64 indicator.
+     *
+     * Example:
+     *   bW91dGg=
+     */
+    if (/={1,2}$/.test(candidate)) {
+        return true;
+    }
+
+    /*
+     * Base64URL-specific characters.
+     */
+    if (/[-_]/.test(candidate)) {
+        return true;
+    }
+
+    /*
+     * Standard Base64 symbols.
+     */
+    if (/[+/]/.test(candidate)) {
+        return true;
+    }
+
+    /*
+     * Digits mixed with letters are a useful signal.
+     */
+    if (
+        /[0-9]/.test(candidate) &&
+        /[A-Za-z]/.test(candidate)
+    ) {
+        return true;
+    }
+
+    /*
+     * Mixed uppercase + lowercase is characteristic of many Base64
+     * encodings.
+     */
+    if (
+        /[A-Z]/.test(candidate) &&
+        /[a-z]/.test(candidate)
+    ) {
+        /*
+         * Very short alphabetic strings are dangerous because ordinary
+         * words can accidentally be legal Base64.
+         *
+         * Only accept them when the decoded result strongly resembles a
+         * human-readable word/text fragment.
+         */
+        if (candidate.length <= 4) {
+            return /^[\p{L}\p{N}'’_-]{2,}$/u.test(
+                decoded,
+            );
+        }
+
+        return true;
+    }
+
+    /*
+     * All-uppercase Base64 can still happen, but require a longer run.
+     */
+    if (
+        candidate.length >= 8 &&
+        /^[A-Z0-9]+$/.test(candidate)
+    ) {
+        return true;
+    }
+
+    /*
+     * Lowercase-only strings are intentionally rejected on the bare path.
+     * Too many normal English words would otherwise be false positives.
+     *
+     * They still decode perfectly when wrapped:
+     *
+     * [[b64]]....[[/b64]]
+     */
+    return false;
+}
+
+
+/**
+ * Decode explicit markers first.
+ *
+ * This is the safest path because the marker establishes intent.
+ *
+ * Both padded and unpadded Base64 work:
+ *
+ *   [[b64]]SGVsbG8=[[/b64]]
+ *   [[b64]]SGVsbG8[[/b64]]
+ *
+ * Base64URL works too.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function decodeB64Markers(text) {
+    if (
+        typeof text !== 'string' ||
+        text.length === 0
+    ) {
+        return text;
+    }
+
+    return text.replace(
+        B64_MARKER_RE,
+        (wholeMatch, encoded) => {
+            const decoded = tryDecodeBase64Utf8(
+                encoded,
+                {
+                    allowWhitespace: true,
+                },
+            );
+
+            /*
+             * Preserve malformed markers instead of deleting content.
+             */
+            return decoded ?? wholeMatch;
+        },
+    );
+}
+
+
+/**
+ * Conservative bare Base64 decoding.
+ *
+ * Examples that can be caught:
+ *
+ *   SGVsbG8=
+ *   SGVsbG8
+ *   Y29kZQ==
+ *   Y29kZQ
+ *   c2V4
+ *
+ * Every candidate must first survive the UTF-8 and canonical round-trip
+ * validation.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function decodeBareBase64Tokens(text) {
+    if (
+        typeof text !== 'string' ||
+        text.length === 0
+    ) {
+        return text;
+    }
+
+    return text.replace(
+        BARE_B64_DECODE_RE,
+        candidate => {
+            const decoded = tryDecodeBase64Utf8(
+                candidate,
+            );
+
+            if (decoded === null) {
+                return candidate;
+            }
+
+            if (
+                !isStrongBareBase64Candidate(
+                    candidate,
+                    decoded,
+                )
+            ) {
+                return candidate;
+            }
+
+            return decoded;
+        },
+    );
+}
+
+
+/**
+ * Full incoming decode pipeline.
+ *
+ * Order matters:
+ *
+ * 1. Explicit marker blocks.
+ * 2. Remaining bare tokens.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function decodeIncoming(text) {
+    if (
+        typeof text !== 'string' ||
+        text.length === 0
+    ) {
+        return text;
+    }
+
+    let result = decodeB64Markers(text);
+
+    result = decodeBareBase64Tokens(result);
+
+    return result;
+}
+
+
+/* ============================================================
+ * Incoming message hook
+ * ============================================================ */
+
+/**
+ * Decodes Base64 generated by the assistant before the message is rendered.
+ *
+ * MESSAGE_RECEIVED gives us the newly inserted chat-array index.
+ *
+ * User and system messages are intentionally ignored.
+ *
+ * @param {number} messageId
+ * @param {string} [_source]
+ * @returns {void}
+ */
+function onMessageReceived(
+    messageId,
+    _source,
+) {
+    try {
+        if (
+            !Number.isInteger(messageId) ||
+            messageId < 0
+        ) {
+            return;
+        }
+
+        const context =
+            SillyTavern.getContext();
+
+        const message =
+            context.chat?.[messageId];
+
+        if (
+            !message ||
+            typeof message !== 'object' ||
+            message.is_user ||
+            message.is_system
+        ) {
+            return;
+        }
+
+        if (
+            typeof message.mes !== 'string' ||
+            message.mes.length === 0
+        ) {
+            return;
+        }
+
+        const before = message.mes;
+
+        const after = decodeIncoming(before);
+
+        if (after === before) {
+            return;
+        }
+
+        message.mes = after;
+
+        if (DEBUG) {
+            console.info(
+                `[${MODULE_NAME}] Decoded incoming message ${messageId}. ` +
+                `${before.length} -> ${after.length} chars.`,
+            );
+        }
+    } catch (error) {
+        console.error(
+            `[${MODULE_NAME}] Failed to decode incoming message:`,
+            error,
+        );
+    }
+}
+
+
+/* ============================================================
  * Base64 Regex rule discovery
  * ============================================================ */
 
@@ -1246,12 +1806,25 @@ if (
         onChatCompletionPromptReady,
     );
 
+    if (event_types?.MESSAGE_RECEIVED) {
+        eventSource.on(
+            event_types.MESSAGE_RECEIVED,
+            onMessageReceived,
+        );
+    } else {
+        console.warn(
+            `[${MODULE_NAME}] MESSAGE_RECEIVED is not available; ` +
+            'incoming Base64 decoding is disabled.',
+        );
+    }
+
     console.log(
         `[${MODULE_NAME}] Loaded. ` +
         'Regex rules containing [[b64]] markers will be reapplied to the final Chat Completion prompt. ' +
         `Tool-call wrapping: ${toolWrapEnabled ? 'enabled' : 'disabled'}, ` +
         `user-turn wrapping: ${wrapUserTurnsEnabled ? 'enabled' : 'disabled'}, ` +
         `ENCODING_PROTOCOL injection: ${injectProtocolEnabled ? 'enabled' : 'disabled'}, ` +
-        `auto-retry: ${autoRetryEnabled ? 'enabled' : 'disabled'}.`,
+        `auto-retry: ${autoRetryEnabled ? 'enabled' : 'disabled'}, ` +
+        `incoming Base64 decoding: ${event_types?.MESSAGE_RECEIVED ? 'enabled' : 'unavailable'}.`,
     );
 }
