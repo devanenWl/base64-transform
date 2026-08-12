@@ -737,18 +737,40 @@ const context = SillyTavern.getContext();
 const {
     eventSource,
     event_types,
+    extensionSettings,
+    saveSettingsDebounced,
 } = context;
 
 /**
- * Loads the stored "Tool-call wrapping" preference.
+ * Namespace used inside the global `extensionSettings` object so this
+ * extension's keys never collide with other extensions.
+ */
+const EXTENSION_SETTINGS_KEY = 'Base64PromptTransform';
+
+/**
+ * Returns this extension's persistent settings object, creating it
+ * on first access.
  *
- * The value is persisted by SillyTavern inside the extension settings
- * file (data/default-user/settings/Base64PromptTransform.json) whenever
- * the checkbox is toggled.
+ * The object is stored under extensionSettings["Base64PromptTransform"]
+ * and persisted by SillyTavern via saveSettingsDebounced().
+ *
+ * @returns {Record<string, unknown>}
+ */
+function getExtensionSettings() {
+    if (!extensionSettings[EXTENSION_SETTINGS_KEY]) {
+        extensionSettings[EXTENSION_SETTINGS_KEY] = {};
+    }
+
+    return extensionSettings[EXTENSION_SETTINGS_KEY];
+}
+
+/**
+ * Loads the stored "Tool-call wrapping" preference from the persistent
+ * extension settings.
  */
 function loadToolWrapSetting() {
     try {
-        const stored = context.extensionSettings?.tool_wrap;
+        const stored = getExtensionSettings().tool_wrap;
 
         if (typeof stored === 'boolean') {
             toolWrapEnabled = stored;
@@ -764,58 +786,75 @@ function loadToolWrapSetting() {
 /**
  * Registers the extension settings panel.
  *
- *     SillyTavern > Extensions > Base64PromptTransform
+ * The panel is appended to SillyTavern's standard extensions settings
+ * container (`#extensions_settings2`), which is rendered inside:
  *
- * If SillyTavern does not expose registerCustomSettings (older versions),
- * the module-level default is used instead and the feature can still be
- * toggled by editing `toolWrapEnabled` in the source.
+ *     SillyTavern > Extensions (puzzle piece) > Extensions > Settings
+ *
+ * The inline-drawer pattern matches how built-in extensions render their
+ * settings, and the checkbox state is persisted through the normal
+ * extensionSettings mechanism.
  */
-function registerExtensionSettings() {
-    if (!context.settings?.registerCustomSettings) {
+function registerExtensionSettingsPanel() {
+    const container = $('#extensions_settings2');
+
+    if (!container || container.length === 0) {
         console.warn(
-            `[${MODULE_NAME}] registerCustomSettings is not available. ` +
-            'The tool-call wrapping toggle will use the source default.',
+            `[${MODULE_NAME}] #extensions_settings2 was not found. ` +
+            'The settings panel will not be rendered; the source default is used.',
         );
 
         return;
     }
 
-    try {
-        context.settings.registerCustomSettings(
-            MODULE_NAME,
-            [
-                {
-                    id: 'tool_wrap',
-                    name: 'Tool-call wrapping',
-                    description:
-                        'Rewrite Base64-bearing history messages as tool-call pairs in the final prompt. ' +
-                        'Together with [[b64]] Regex encoding this reliably passes the upstream content filter, ' +
-                        'even for large explicit histories. Disable to send a plain prompt instead.',
-                    type: 'checkbox',
-                    value: toolWrapEnabled,
-                },
-            ],
-            null,
-            () => {
-                loadToolWrapSetting();
-                context.saveSettingsDebounced();
-            },
-        );
+    const panelHtml = `
+        <div class="inline-drawer b64pt-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b data-i18n="Base64PromptTransform">Base64PromptTransform</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content">
+                <label class="checkbox_label" for="b64pt_tool_wrap">
+                    <input id="b64pt_tool_wrap" type="checkbox" ${toolWrapEnabled ? 'checked' : ''} />
+                    <span data-i18n="Tool-call wrapping">Tool-call wrapping</span>
+                </label>
+                <small data-i18n="Rewrite Base64-bearing history messages as tool-call pairs in the final prompt. Together with [[b64]] Regex encoding this reliably passes the upstream content filter, even for large explicit histories. Disable to send a plain prompt instead.">
+                    Rewrite Base64-bearing history messages as tool-call pairs in the final prompt.
+                    Together with [[b64]] Regex encoding this reliably passes the upstream content filter,
+                    even for large explicit histories. Disable to send a plain prompt instead.
+                </small>
+            </div>
+        </div>
+    `;
 
-        /*
-         * Pick up a previously stored value immediately, before the user
-         * opens the settings panel.
-         */
-        loadToolWrapSetting();
-    } catch (error) {
-        console.error(
-            `[${MODULE_NAME}] Failed to register settings:`,
-            error,
+    container.append(panelHtml);
+
+    $('#b64pt_tool_wrap').on('change', function () {
+        toolWrapEnabled = $(this).prop('checked');
+
+        getExtensionSettings().tool_wrap = toolWrapEnabled;
+
+        saveSettingsDebounced();
+
+        console.info(
+            `[${MODULE_NAME}] Tool-call wrapping set to ${toolWrapEnabled ? 'enabled' : 'disabled'}.`,
         );
-    }
+    });
+
+    /*
+     * Pick up a previously stored value immediately, before the user
+     * opens the settings panel.
+     */
+    loadToolWrapSetting();
+
+    /*
+     * Keep the checkbox in sync with the stored value (e.g. after a
+     * settings import).
+     */
+    $('#b64pt_tool_wrap').prop('checked', toolWrapEnabled);
 }
 
-registerExtensionSettings();
+registerExtensionSettingsPanel();
 
 if (
     !eventSource ||
